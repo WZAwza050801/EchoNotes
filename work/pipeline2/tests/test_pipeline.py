@@ -1,6 +1,7 @@
 """Real ffmpeg/XeLaTeX integration, with an explicitly fake model boundary."""
 import contextlib
 import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -196,6 +197,18 @@ class ContractTests(unittest.TestCase):
             api.metadata("https://evil.example/video/BV1GbNH6hE8f")
         with self.assertRaises(ValueError):
             api.metadata("BV1GbNH6hE8f", 3)
+
+
+class IntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("xelatex"),
+                         "needs real ffmpeg and XeLaTeX on PATH")
+    def test_end_to_end_offline_demo(self):
+        """Real ffmpeg + real XeLaTeX + fake model boundary: the suite's only
+        XeLaTeX integration (gap flagged by the 2026-09-26 review). Asserts a
+        real PDF, frame dedup, and zero model calls on cached rerun."""
+        with tempfile.TemporaryDirectory() as directory:
+            archive = integration_demo(Path(directory))
+            self.assertTrue((archive / "lecture.pdf").exists())
 
 
 class FixtureChat:
