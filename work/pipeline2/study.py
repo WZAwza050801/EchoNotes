@@ -6,10 +6,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "work.pipeline2"
 
 from .concept_map import validate_concept_map
-from .core import cached, digest, read_json, write_json
-from .models import load_chat
+from .core import cached, digest, load_dotenv, read_json, write_json
+from .models import Chat, load_chat
 from .pipeline2 import file_hash, safe_name
 from .render import compile_pdf, math_tex
 from .study_render import render_study
@@ -180,6 +185,11 @@ def build(lecture_path, output_root, planner, writer, vision):
     out = Path(output_root).resolve() / (
         "学习讲义-" + safe_name(lecture["meta"]["title"]) + f"-{date.today()}-{version}")
     out.mkdir(parents=True, exist_ok=True)
+    # Persist the throttle clock into the output directory so a restarted
+    # process keeps honoring MIN_INTERVAL (file-clock semantics).
+    for client in (planner, writer, vision):
+        if isinstance(client, Chat):
+            client.clock_path = out / "cache" / ".request-clock.json"
     lock = out / ".running"
     handle = lock.open("x")
     try:
@@ -374,6 +384,7 @@ def build(lecture_path, output_root, planner, writer, vision):
 
 
 def main():
+    load_dotenv()
     parser = argparse.ArgumentParser(description="音画证据 → 学习目标 + 一体化彩色讲义")
     parser.add_argument("lecture", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("output/学习讲义"))

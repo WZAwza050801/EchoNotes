@@ -48,13 +48,30 @@ class EvidenceTests(unittest.TestCase):
             {"uncertainties": "公式模糊", "formulas": {"latex": "x"}, "symbols": {}},
             {"uncertainties": [{"reason": "符号被遮挡"}], "formulas": [], "symbols": []},
         ]})
-        self.assertEqual([b["uncertainties"] for b in result["blocks"]],
-                         [[], ["公式模糊"], ["符号被遮挡"]])
+        self.assertEqual([b["uncertainties"] for b in result["blocks"]][0], [])
+        self.assertEqual(result["blocks"][1]["uncertainties"][0], "公式模糊")
         self.assertEqual(result["blocks"][0]["formulas"], [])
-        self.assertEqual(result["blocks"][1]["formulas"], [{"latex": "x"}])
+        # A formula without an explicit uncertain flag is conservatively marked
+        # for human review instead of rejecting the whole window.
+        self.assertEqual(result["blocks"][1]["formulas"], [{"latex": "x", "uncertain": True}])
         self.assertEqual(result["blocks"][1]["symbols"], [{}])
+        self.assertTrue(any("待核验" in note for note in result["blocks"][1]["uncertainties"]))
+        self.assertEqual(result["blocks"][2]["uncertainties"], ["符号被遮挡"])
         with self.assertRaises(ValueError):
             normalize_map({"blocks": [{"uncertainties": [{"confidence": .2}]}]})
+
+    def test_formula_uncertainty_missing_flag_is_conservatively_marked(self):
+        result = normalize_map({"blocks": [{
+            "kind": "definition", "title": "t", "text": "正文",
+            "segment_ids": ["s1"], "frame_ids": ["f1"],
+            "uncertainties": [], "symbols": [],
+            "formulas": [{"latex": "x", "frame_id": "f1", "uncertain": "yes"},
+                         {"latex": "y", "frame_id": "f1", "uncertain": False}],
+        }]})
+        formulas = result["blocks"][0]["formulas"]
+        self.assertEqual([f["uncertain"] for f in formulas], [True, False])
+        self.assertEqual(len(result["blocks"][0]["uncertainties"]), 1)
+        self.assertIn("待核验", result["blocks"][0]["uncertainties"][0])
 
     def test_formula_source_from_same_window_is_added_to_block_evidence(self):
         window = {"frames": [{"id": "f1"}, {"id": "f2"}]}

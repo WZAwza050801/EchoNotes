@@ -2,7 +2,28 @@
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+
+
+def load_dotenv(path=None):
+    """Load KEY=VALUE lines from .env into os.environ (existing values win).
+
+    Lets users configure keys by filling .env as the README promises, without
+    exporting anything. Never overrides variables already set in the shell.
+    """
+    path = Path(path) if path else Path(__file__).resolve().parent / ".env"
+    if not path.exists():
+        return False
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return True
 
 
 def read_json(path):
@@ -149,6 +170,14 @@ def normalize_map(data, window=None):
                         block[name] = []
                     elif isinstance(value, dict):
                         block[name] = [value]
+                # Conservative repair for a missing/mistyped formula.uncertain:
+                # mark it for human review instead of rejecting the whole window.
+                for index, formula in enumerate(block["formulas"], 1):
+                    if isinstance(formula, dict) and not isinstance(formula.get("uncertain"), bool):
+                        formula["uncertain"] = True
+                        block["uncertainties"].append(
+                            f"第 {index} 条公式的 uncertain 标记缺失或类型错误，"
+                            "已保守按“待核验”处理，请人工复核该公式。")
                 if allowed_frames is not None and isinstance(block.get("frame_ids"), list):
                     for formula in block["formulas"]:
                         source = formula.get("frame_id") if isinstance(formula, dict) else None

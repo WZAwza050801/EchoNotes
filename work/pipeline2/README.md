@@ -2,6 +2,10 @@
 
 > 设计理念、证据纪律与架构说明见[主 README](../../README.md)。本手册只讲操作：
 > 命令、参数、环境变量、缓存规则与排障。
+>
+> 模型层（core/models/writing）与独立仓库 [Ech_lecture](https://github.com/WZAwza050801/Ech_lecture)
+> 同源，2026-09-27 已对齐其 `cf036f1`（重试分流 / reduce 重试 / EXTRA_BODY 护栏 /
+> 节流时钟落盘）；后续模型层修复以两边同步提交为准。
 
 ## 运行环境
 
@@ -90,8 +94,12 @@ API_KEY / KEY_LABEL / MAX_TOKENS / TEMPERATURE`。
 | `ECHONOTES_MODEL_RETRIES` | 模型请求重试次数，默认 3 |
 | `ECHONOTES_MODEL_BACKOFF` | 重试退避基数（秒），默认 10，按次数阶梯递增 |
 | `ECHONOTES_MODEL_TIMEOUT` | 单次请求超时（秒），默认 180；密集板书窗口建议 600 |
+| `ECHONOTES_MODEL_MIN_INTERVAL` | 同一角色两次请求的最小间隔（秒），默认 0；限流账号设 21。时钟落盘到运行目录（`cache/.request-clock.json`），重启续跑仍计时；N 个并行进程合计 RPM 约乘 N，请加倍或错峰 |
+| `ECHONOTES_<ROLE>_EXTRA_BODY` | provider 私有参数逃生舱（JSON 对象）。不得覆盖保留键 `model/messages/stream/response_format/temperature/max_tokens`，否则实际请求与缓存身份脱节——启动时即报错并指明变量名 |
 | `BILIBILI_COOKIE` | 完整 cookie 请求头；未设置时读取相邻管线一源码中的既有 cookie 字面量 |
 | `DEEPSEEK_API_KEY` / `OPENROUTER_API_KEY` | 无注册表时的兜底 |
+
+`.env` 放在 `work/pipeline2/.env`（包目录），启动时自动加载，shell 里已设置的同名变量优先。
 
 代码默认值：文本/规划/写作者 `deepseek-v4-pro`（DeepSeek 直连），清洗 `deepseek-chat`，
 视觉 `qwen/qwen3-vl-235b-a22b-instruct`（OpenRouter）；全部可用环境变量覆盖。
@@ -101,6 +109,9 @@ plan 类端点（百炼、Kimi Code 等）通过 `PROVIDER/BASE_URL/KEY_LABEL/MO
 ## 缓存与断点
 
 - 缓存键 = 输入、模型、prompt、参数与帧内容摘要；参数或证据变化自动重跑对应步骤。
+- **缓存迁移规则**：早期版本不把 temperature/extra_body 计入缓存身份。曾设过非默认
+  `ECHONOTES_<ROLE>_TEMPERATURE` / `_EXTRA_BODY` 的用户升级到计入这些字段的版本后，
+  旧缓存会失配重打（一次性成本，属预期行为）；从未改过这两项的用户旧缓存继续命中。
 - 同一视频有运行锁（`.running`）；异常退出自动清锁，进程被强杀后需确认旧进程
   已停再手动删除锁文件。
 - ASR 每 50 段写 `asr-output.partial.json` 检查点（仅供诊断，成功后合并为正式缓存）。

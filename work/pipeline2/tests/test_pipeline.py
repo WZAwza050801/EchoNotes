@@ -1,13 +1,16 @@
 """Real ffmpeg/XeLaTeX integration, with an explicitly fake model boundary."""
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from work.pipeline2.core import cached, read_json, validate_outline, write_json
 from work.pipeline2.media import Bilibili
+from work.pipeline2.models import DeterministicModelError
 from work.pipeline2.pipeline2 import parser, run
-from work.pipeline2.writing import outline
-
+from work.pipeline2.writing import outline, polish, retry_model
 
 class ContractTests(unittest.TestCase):
     def test_cache_invalidates_on_settings_change(self):
@@ -17,11 +20,142 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(cached(path, {"model": "a"}, lambda: 2), 1)
             self.assertEqual(cached(path, {"model": "b"}, lambda: 2), 2)
 
+    def test_polish_invalid_response_is_never_cached_and_retry_succeeds(self):
+        """Regression: validation used to run after caching, so a structurally
+        bad response poisoned the cache and failed on every rerun."""
+        segments = [{"id": f"s{i:06d}", "text": f"第 {i} 句。"} for i in range(3)]
+        attempts = {"n": 0}
+
+        class FlakyChat:
+            identity = {"model": "fixture", "temperature": 0.15, "extra_body": {}}
+
+            def json(self, _system, payload, images=()):
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    return {"segments": [{"id": "s000000", "text": "坏响应：编号缺失"}]}
+                return {"segments": [{"id": s["id"], "text": s["text"]} for s in payload]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, warnings = polish(segments, {}, FlakyChat(), Path(directory))
+            self.assertEqual([s["id"] for s in result], [s["id"] for s in segments])
+            self.assertEqual(attempts["n"], 2)
+            # The invalid response must not have been cached: a fresh run with a
+            # failing client must fail, not silently read the bad cache back.
+            class FailingChat:
+                identity = FlakyChat.identity
+                def json(self, *_a, **_k):
+                    raise AssertionError("should have been served from cache")
+            result2, _ = polish(segments, {}, FailingChat(), Path(directory))
+            self.assertEqual(len(result2), 3)
+
+    def test_polish_id_mismatch_error_reports_diagnostics(self):
+        segments = [{"id": "s000000", "text": "唯一一句。"}]
+
+        class DroppingChat:
+            identity = {"model": "fixture", "temperature": 0.15, "extra_body": {}}
+
+            def json(self, _system, payload, images=()):
+                return {"segments": []}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError) as caught:
+                polish(segments, {}, DroppingChat(), Path(directory))
+        self.assertIn("expected 1, got 0", str(caught.exception))
+        self.assertIn("missing", str(caught.exception))
+
     def test_reduce_cannot_drop_or_duplicate_blocks(self):
         blocks = [{"id": "b1"}, {"id": "b2"}]
         for ids in [["b1"], ["b1", "b2", "b1"], ["b1", "invented"]]:
             with self.assertRaises(ValueError):
                 validate_outline({"sections": [{"title": "标题", "block_ids": ids}]}, blocks)
+
+    def test_reduce_group_retries_schema_failures(self):
+        """Regression: reduce groups had no bounded retry (unlike polish/map),
+        so one malformed outline killed the whole run."""
+        blocks = [{"id": f"b{i}", "kind": "explanation", "title": f"主题 {i}",
+                   "start": i, "end": i + 1, "text": "摘要"} for i in range(3)]
+        calls = {"group": 0}
+
+        class FlakyReduceChat:
+            identity = {"model": "fixture"}
+
+            def json(self, _system, payload, images=()):
+                if isinstance(payload, list):
+                    calls["group"] += 1
+                    if calls["group"] == 1:
+                        return {"sections": [{"title": "坏目录", "block_ids": ["b0"]}]}
+                    return {"sections": [{"title": "全部",
+                                          "block_ids": [b["id"] for b in payload]}]}
+                return {"sections": payload["candidate_sections"]}
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("work.pipeline2.writing.time.sleep"):
+            result = outline(blocks, FlakyReduceChat(), Path(directory))
+        self.assertEqual(calls["group"], 2)
+        self.assertEqual(result["sections"],
+                         [{"title": "全部", "block_ids": ["b0", "b1", "b2"]}])
+
+    def test_reduce_group_deterministic_failure_is_not_retried(self):
+        """finish_reason=length/content_filter cannot be fixed by retrying;
+        the group must fail fast instead of burning 3x max_tokens."""
+        blocks = [{"id": "b0", "kind": "explanation", "title": "t",
+                   "start": 0, "end": 1, "text": "摘要"}]
+        calls = {"n": 0}
+
+        class TruncatedChat:
+            identity = {"model": "fixture"}
+
+            def json(self, *_args, **_kwargs):
+                calls["n"] += 1
+                raise DeterministicModelError("finish_reason=length")
+
+        sleeps = []
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("work.pipeline2.writing.time.sleep",
+                      side_effect=lambda seconds: sleeps.append(seconds)), \
+                self.assertRaises(DeterministicModelError):
+            outline(blocks, TruncatedChat(), Path(directory))
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(sleeps, [])
+
+    def test_retry_model_logs_every_attempt_and_sleeps_only_between_attempts(self):
+        """Regression: retry_model swallowed the first two failures silently and
+        slept even after the final attempt (43 dead batches = 10 minutes of
+        pure waiting before the error surfaced)."""
+        sleeps = []
+        failures = {"n": 0}
+
+        def twice_bad():
+            failures["n"] += 1
+            if failures["n"] < 3:
+                raise ValueError(f"schema issue {failures['n']}")
+            return "ok"
+
+        output = io.StringIO()
+        with patch("work.pipeline2.writing.time.sleep",
+                   side_effect=lambda seconds: sleeps.append(seconds)), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(retry_model(twice_bad, attempts=3, backoff=5, label="fixture"), "ok")
+        self.assertEqual(sleeps, [5, 10])
+        self.assertEqual(output.getvalue().count("[retry] fixture attempt"), 2)
+        self.assertIn("schema issue 1", output.getvalue())
+        self.assertIn("schema issue 2", output.getvalue())
+
+        # All attempts fail: every attempt is logged, the last error is raised,
+        # and there is no pointless sleep after the final failure.
+        sleeps.clear()
+        output = io.StringIO()
+
+        def always_bad():
+            raise ValueError("always bad")
+
+        with patch("work.pipeline2.writing.time.sleep",
+                   side_effect=lambda seconds: sleeps.append(seconds)), \
+                contextlib.redirect_stdout(output):
+            with self.assertRaises(ValueError) as caught:
+                retry_model(always_bad, attempts=3, backoff=5, label="fixture")
+        self.assertEqual(sleeps, [5, 10])
+        self.assertEqual(output.getvalue().count("[retry] fixture attempt"), 3)
+        self.assertIn("always bad", str(caught.exception))
 
     def test_final_reduce_repairs_singleton_sections(self):
         blocks = [
